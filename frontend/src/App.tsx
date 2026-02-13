@@ -118,7 +118,7 @@ export default function App() {
         return <UnifiedSearch />;
 
       case 'map':
-        return <MapIntelligence />;
+        return <MapIntelligence visualTelemetry={videoAnalysis?.visual_telemetry} currentTime={0} />;
 
       case 'pipeline':
         return <PipelineMonitor />;
@@ -193,8 +193,8 @@ export default function App() {
                       setMapViewActive(false);
                     }}
                     className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${isActive
-                        ? 'bg-[#3dd4c4]/20 text-[#3dd4c4] border border-[#3dd4c4]/30'
-                        : 'hover:bg-[#1e1e26] text-muted-foreground hover:text-foreground'
+                      ? 'bg-[#3dd4c4]/20 text-[#3dd4c4] border border-[#3dd4c4]/30'
+                      : 'hover:bg-[#1e1e26] text-muted-foreground hover:text-foreground'
                       }`}
                   >
                     <Icon className="w-5 h-5 shrink-0" />

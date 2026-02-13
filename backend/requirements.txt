@@ -3,4 +3,5 @@ uvicorn
 opencv-python
 numpy
 python-multipart
-ffmpeg-python
+openai
+python-dotenv

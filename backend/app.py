@@ -3,43 +3,31 @@ import cv2
 import uuid
 import json
 import shutil
-import numpy as np
-import subprocess
-import ffmpeg
+
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydub import AudioSegment
+
+
+import re
+import base64
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) 
 
 # ==================================================
 # Configuration
 # ==================================================
 
-FFMPEG_BIN = r"C:\ffmpeg\bin\ffmpeg.exe"
-FFPROBE_BIN = r"C:\ffmpeg\bin\ffprobe.exe"
-
-os.environ["FFMPEG_BINARY"] = FFMPEG_BIN
-os.environ["FFPROBE_BINARY"] = FFPROBE_BIN
-os.environ["PATH"] += os.pathsep + os.path.dirname(FFMPEG_BIN)
 
 UPLOAD_DIR = "uploads"
-FUSED_FRAME_DIR = "output/fused_frames"
-AUDIO_DIR = "output/audio"
-
-ANALYSIS_SIZE = (320, 180)
-FRAME_SKIP = 2
-
-HIST_CUT_THRESHOLD = 0.65
-PIXEL_CHANGE_RATIO = 0.04
-FLOW_MAG_THRESHOLD = 1.2
-
-CONFIRM_FRAMES = 4
-MIN_SEGMENT_DURATION = 0.5
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(FUSED_FRAME_DIR, exist_ok=True)
-os.makedirs(AUDIO_DIR, exist_ok=True)
+
+
 
 # ==================================================
 # FastAPI App
@@ -81,7 +69,7 @@ def extract_video_metadata(video_path):
 
 def extract_embedded_telemetry(video_path):
     cmd = [
-        FFPROBE_BIN,
+        "ffprobe",
         "-v", "quiet",
         "-print_format", "json",
         "-show_format",
@@ -151,156 +139,80 @@ def extract_embedded_telemetry(video_path):
 
     return telemetry
 
-# ==================================================
-# Audio Energy Extraction
-# ==================================================
-
-def extract_audio_energy(video_path):
-    audio_path = os.path.join(AUDIO_DIR, f"{uuid.uuid4()}.wav")
-    
-    try:
-        # Check if audio stream exists first to avoid ffmpeg error
-        probe = ffmpeg.probe(video_path)
-        audio_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
-        
-        if not audio_stream:
-            print(f"No audio stream found in {video_path}")
-            return np.array([0.0])
-
-        ffmpeg.input(video_path).output(
-            audio_path, ac=1, ar=16000, loglevel="error"
-        ).run(overwrite_output=True)
-
-        audio = AudioSegment.from_wav(audio_path)
-        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-        
-        # Avoid division by zero
-        max_val = np.max(np.abs(samples))
-        if max_val == 0:
-            return np.array([0.0])
-            
-        samples /= max_val
-
-        energies = []
-        window = 1600  # 100 ms
-
-        for i in range(0, len(samples), window):
-            energies.append(np.mean(samples[i:i+window] ** 2))
-            
-        # Clean up
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-        return np.array(energies)
-
-    except ffmpeg.Error as e:
-        print(f"FFmpeg error extracting audio: {e.stderr.decode() if e.stderr else str(e)}")
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return np.array([0.0])
-    except Exception as e:
-        print(f"General error extracting audio: {e}")
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return np.array([0.0])
 
 # ==================================================
-# Vision Change Metrics
+# GPT-4o Vision Analysis
 # ==================================================
 
-def histogram_distance(f1, f2):
-    h1 = cv2.calcHist([cv2.cvtColor(f1, cv2.COLOR_BGR2HSV)], [0,1], None, [32,32], [0,180,0,256])
-    h2 = cv2.calcHist([cv2.cvtColor(f2, cv2.COLOR_BGR2HSV)], [0,1], None, [32,32], [0,180,0,256])
-    cv2.normalize(h1, h1)
-    cv2.normalize(h2, h2)
-    return cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
-
-def pixel_change_ratio(f1, f2):
-    diff = cv2.absdiff(
-        cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY),
-        cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
-    )
-    return np.count_nonzero(diff > 25) / diff.size
-
-def motion_magnitude(g1, g2):
-    flow = cv2.calcOpticalFlowFarneback(g1, g2, None, 0.5, 2, 15, 2, 5, 1.1, 0)
-    mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
-    return np.mean(mag)
-
-# ==================================================
-# ISR Segmentation Engine
-# ==================================================
-
-def process_video_isr(video_path):
+def analyze_with_gpt4o(video_path):
+    print("Starting GPT-4o Video Analysis...")
     cap = cv2.VideoCapture(video_path)
-    audio_energy = extract_audio_energy(video_path)
-
-    fused_frames = []
-    prev_small, prev_gray = None, None
-    rep_frame = None
-
-    fuse_start = 0
-    current_time = 0
-    frame_idx = 0
-    change_votes = 0
-    confidence_accumulator = []
-
+    
+    base64Frames = []
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0: fps = 30
+    
+    frame_interval = int(fps) # 1 frame per second
+    frame_count = 0
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
-        frame_idx += 1
-        if frame_idx % FRAME_SKIP != 0:
-            continue
-
-        current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        small = cv2.resize(frame, ANALYSIS_SIZE)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
-        if prev_small is None:
-            prev_small, prev_gray = small, gray
-            rep_frame = frame
-            fuse_start = current_time
-            continue
-
-        hist = histogram_distance(prev_small, small)
-        pixel = pixel_change_ratio(prev_small, small)
-        motion = pixel > PIXEL_CHANGE_RATIO and motion_magnitude(prev_gray, gray) > FLOW_MAG_THRESHOLD
-
-        audio_idx = min(int(current_time * 10), len(audio_energy) - 1)
-        audio_change = audio_energy[audio_idx] > np.mean(audio_energy) * 2
-
-        confidence = hist + (1.5 if motion else 0) + (1.0 if audio_change else 0)
-        confidence_accumulator.append(confidence)
-
-        if hist > HIST_CUT_THRESHOLD or motion or audio_change:
-            change_votes += 1
-        else:
-            change_votes = max(0, change_votes - 1)
-
-        if change_votes >= CONFIRM_FRAMES and (current_time - fuse_start) >= MIN_SEGMENT_DURATION:
-            fid = str(uuid.uuid4())
-            path = os.path.join(FUSED_FRAME_DIR, f"{fid}.jpg")
-            cv2.imwrite(path, rep_frame)
-
-            fused_frames.append({
-                "frame_id": fid,
-                "start_time": round(fuse_start, 2),
-                "end_time": round(current_time, 2),
-                "confidence": round(np.mean(confidence_accumulator), 3),
-                "path": path
-            })
-
-            rep_frame = frame
-            fuse_start = current_time
-            change_votes = 0
-            confidence_accumulator.clear()
-
-        prev_small, prev_gray = small, gray
-
+            
+        if frame_count % frame_interval == 0:
+            _, buffer = cv2.imencode(".jpg", frame)
+            base64Frames.append(base64.b64encode(buffer).decode("utf-8"))
+            
+        frame_count += 1
+        
     cap.release()
-    return fused_frames
+    print(f"Extracted {len(base64Frames)} frames for analysis.")
+
+    # Chunking to avoid token limits (10 frames per request)
+    chunk_size = 10
+    all_telemetry = []
+    
+    for i in range(0, len(base64Frames), chunk_size):
+        chunk = base64Frames[i:i+chunk_size]
+        print(f"Processing chunk {i//chunk_size + 1}...")
+        
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an ISR telemetry extractor. Analyze these video frames. For each frame, read the Green HUD text to extract: Speed (km/h), Altitude (ft), Latitude, Longitude. Also detect if a 'Target' (vehicle/ship) is visible. Return valid JSON only: [{ 'time': 0, 'telemetry': { 'lat': 35.85, 'lon': 14.51, 'speed': 800, 'alt': 20000 }, 'target_detected': true }]. The time should correspond to the frame index (e.g. frame 0 is time 0, frame 1 is time 1)."
+            },
+            {
+                "role": "user",
+                "content": [
+                    *map(lambda x: {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{x}"}}, chunk)
+                ],
+            }
+        ]
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                max_tokens=2000,
+            )
+            
+            content = response.choices[0].message.content
+            # Cleanup JSON string
+            json_str = content.replace("```json", "").replace("```", "").strip()
+            chunk_data = json.loads(json_str)
+            
+            # Adjust time based on chunk offset
+            for item in chunk_data:
+                item['time'] = item.get('time', 0) + i
+                
+            all_telemetry.extend(chunk_data)
+            
+        except Exception as e:
+            print(f"Error processing chunk {i}: {e}")
+            
+    return all_telemetry
+
 
 # ==================================================
 # API: Upload Video
@@ -316,14 +228,21 @@ async def upload_video(file: UploadFile = File(...)):
 
     metadata = extract_video_metadata(path)
     telemetry = extract_embedded_telemetry(path)
-    segments = process_video_isr(path)
+
+    
+    # New processing (GPT-4o)
+    visual_telemetry = []
+    try:
+        visual_telemetry = analyze_with_gpt4o(path)
+    except Exception as e:
+        print(f"GPT-4o Analysis Failed: {e}")
+        visual_telemetry = []
 
     return JSONResponse({
         "video_id": vid,
         "metadata": metadata,
         "embedded_telemetry": telemetry,
-        "fused_frame_count": len(segments),
-        "fused_frames": segments
+        "visual_telemetry": visual_telemetry
     })
 
 # ==================================================

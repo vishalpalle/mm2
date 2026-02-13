@@ -26,3 +26,14 @@ Thumbs.db
 backend/uploads/
 backend/output/
 backend/*.sqlite3
+
+# Large Model Files
+*.pt
+*.pth
+*.onnx
+
+# Temporary Files
+test.py
+*.tmp
+*.bak
+backend/package-lock.json
